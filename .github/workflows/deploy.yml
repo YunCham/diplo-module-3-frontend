@@ -87,7 +87,7 @@ jobs:
           if [ -z "${{ secrets.BACKEND_API_URL }}" ]; then
             echo "ERROR: secret BACKEND_API_URL no definido."
             echo "Debe contener la URL pública del backend (output backend_url del pipeline Terraform)."
-            echo "Ejemplo: a1b2c3d4e5f6.us-east-1.elb.amazonaws.com"
+            echo "Con esquema, p. ej.: http://a1b2c3d4e5f6.us-east-1.elb.amazonaws.com"
             exit 1
           fi
           echo "BACKEND_API_URL definido: ${{ secrets.BACKEND_API_URL }}"
