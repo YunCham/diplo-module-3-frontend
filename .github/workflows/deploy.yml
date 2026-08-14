@@ -1,9 +1,9 @@
-# CI/CD del frontend en AWS:
-#   CI (build) -> build imagen -> scan Trivy (gate) -> push a ECR -> deploy en EC2.
-# Autenticación a AWS por access keys (usuario IAM phoenix-frontend-ci).
-# El backend corre como contenedor en el MISMO EC2, en la red Docker 'web';
-# Nginx hace reverse-proxy de /api hacia él.
-name: Frontend CI/CD (AWS ECR + EC2)
+# CI/CD del frontend en EKS:
+#   CI (lint, test, build) -> build imagen (VITE_API_URL = BACKEND_API_URL)
+#   -> scan Trivy (gate) -> push a ECR.
+# El deployment en el clúster EKS lo gestiona Terraform desde el repo backend;
+# este workflow solo publica la imagen :latest que el Deployment de EKS consume.
+name: Frontend CI/CD (build + push ECR)
 
 on:
   workflow_dispatch:
@@ -14,7 +14,6 @@ permissions:
 env:
   AWS_REGION: us-east-1            # <-- ajusta a tu región
   ECR_REPOSITORY: phoenix-frontend
-  CONTAINER_NAME: phoenix-frontend
   NODE_VERSION: '22'
 
 jobs:
@@ -83,6 +82,16 @@ jobs:
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ env.AWS_REGION }}
 
+      - name: Validar secret BACKEND_API_URL
+        run: |
+          if [ -z "${{ secrets.BACKEND_API_URL }}" ]; then
+            echo "ERROR: secret BACKEND_API_URL no definido."
+            echo "Debe contener la URL pública del backend (output backend_url del pipeline Terraform)."
+            echo "Ejemplo: a1b2c3d4e5f6.us-east-1.elb.amazonaws.com"
+            exit 1
+          fi
+          echo "BACKEND_API_URL definido: ${{ secrets.BACKEND_API_URL }}"
+
       - name: Login a Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
@@ -95,6 +104,8 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       # Build local (load) para poder ESCANEAR antes de publicar en ECR.
+      # VITE_API_URL queda "horneado" en el bundle: el navegador llamará
+      # directo al backend por su URL pública (ELB).
       - name: Build imagen (local, para escanear)
         uses: docker/build-push-action@v6
         with:
@@ -102,7 +113,7 @@ jobs:
           load: true
           tags: local/${{ env.ECR_REPOSITORY }}:scan
           build-args: |
-            VITE_API_URL=/api
+            VITE_API_URL=${{ secrets.BACKEND_API_URL }}
             GIT_SHA=${{ github.sha }}
             VERSION=${{ steps.meta.outputs.tag }}
           cache-from: type=gha
@@ -144,73 +155,11 @@ jobs:
           docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:${TAG}
           docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest
 
-  # ---------------------------------------------------------------------------
-  deploy:
-    name: Deploy en EC2 (pull desde ECR + run endurecido)
-    needs: build-scan-push
-    runs-on: ubuntu-latest
-    steps:
-      - name: Deploy por SSH
-        uses: appleboy/ssh-action@v1.2.0
-        env:
-          IMAGE_TAG: ${{ needs.build-scan-push.outputs.image_tag }}
-          AWS_REGION: ${{ env.AWS_REGION }}
-          ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
-          CONTAINER_NAME: ${{ env.CONTAINER_NAME }}
-        with:
-          host: ${{ secrets.EC2_HOST }}
-          username: ${{ secrets.EC2_USER }}
-          key: ${{ secrets.EC2_SSH_KEY }}
-          envs: IMAGE_TAG,AWS_REGION,ECR_REPOSITORY,CONTAINER_NAME
-          script: |
-            set -euo pipefail
-
-            if [ -z "${IMAGE_TAG}" ]; then echo "ERROR: IMAGE_TAG vacío"; exit 1; fi
-
-            # --- Bootstrap: instala Docker solo si no existe ---
-            if ! command -v docker &> /dev/null; then
-              echo "Docker no encontrado. Instalando..."
-              sudo dnf update -y
-              sudo dnf install -y docker
-              sudo systemctl enable --now docker
-              sudo mkdir -p /usr/local/lib/docker/cli-plugins
-              sudo curl -fsSL https://github.com/docker/compose/releases/download/v2.29.7/docker-compose-linux-x86_64 \
-                -o /usr/local/lib/docker/cli-plugins/docker-compose
-              sudo chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
-              echo "Docker instalado correctamente."
-            fi
-
-            ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
-            ECR_REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-            IMAGE="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
-
-            echo "Desplegando ${IMAGE}"
-
-            # Login a ECR usando el ROL IAM de la instancia (sin claves en el host).
-            aws ecr get-login-password --region "$AWS_REGION" \
-              | sudo docker login --username AWS --password-stdin "$ECR_REGISTRY"
-
-            # Red compartida frontend <-> backend (idempotente).
-            sudo docker network create web 2>/dev/null || true
-
-            sudo docker pull "$IMAGE"
-
-            sudo docker stop  "$CONTAINER_NAME" 2>/dev/null || true
-            sudo docker rm    "$CONTAINER_NAME" 2>/dev/null || true
-
-            # Run endurecido: non-root (en la imagen) + read-only + sin capabilities
-            # + sin escalada de privilegios + límites de recursos + tmpfs escribibles.
-            sudo docker run -d \
-              --name "$CONTAINER_NAME" \
-              --restart unless-stopped \
-              --network web \
-              -p 80:8080 \
-              --read-only \
-              --tmpfs /tmp \
-              --tmpfs /var/cache/nginx \
-              --cap-drop ALL \
-              --security-opt no-new-privileges \
-              --memory 128m --cpus 0.5 \
-              "$IMAGE"
-
-            sudo docker image prune -f
+      - name: Recordatorio deploy EKS
+        run: |
+          echo "================================================================"
+          echo "   Imagen ${ECR_REPOSITORY}:latest publicada."
+          echo "   El Deployment en EKS usa imagePullPolicy: Always."
+          echo "   Espera ~1 min y valida http://<frontend_url>"
+          echo "   (frontend_url es el output del pipeline Terraform)."
+          echo "================================================================"
