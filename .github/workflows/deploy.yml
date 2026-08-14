@@ -1,0 +1,216 @@
+# CI/CD del frontend en AWS:
+#   CI (build) -> build imagen -> scan Trivy (gate) -> push a ECR -> deploy en EC2.
+# Autenticación a AWS por access keys (usuario IAM phoenix-frontend-ci).
+# El backend corre como contenedor en el MISMO EC2, en la red Docker 'web';
+# Nginx hace reverse-proxy de /api hacia él.
+name: Frontend CI/CD (AWS ECR + EC2)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1            # <-- ajusta a tu región
+  ECR_REPOSITORY: phoenix-frontend
+  CONTAINER_NAME: phoenix-frontend
+  NODE_VERSION: '22'
+
+jobs:
+  # ---------------------------------------------------------------------------
+  ci:
+    name: CI (lint, test, build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Instalar dependencias
+        run: npm ci
+
+      - name: Lint Dockerfile (Hadolint)
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          failure-threshold: error
+
+      - name: Secrets scan (Gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Vulnerabilidades en dependencias (Trivy fs)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          ignore-unfixed: true
+
+      - name: Lint
+        run: npm run lint --if-present
+
+      - name: Tests
+        run: npm run test --if-present
+
+      - name: Build de producción (verifica que compile)
+        run: npm run build
+
+  # ---------------------------------------------------------------------------
+  build-scan-push:
+    name: Build → Scan (Trivy) → Push a ECR
+    needs: ci
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configurar credenciales AWS (access keys)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login a Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Tag de imagen (SHA corto)
+        id: meta
+        run: echo "tag=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Build local (load) para poder ESCANEAR antes de publicar en ECR.
+      - name: Build imagen (local, para escanear)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: local/${{ env.ECR_REPOSITORY }}:scan
+          build-args: |
+            VITE_API_URL=/api
+            GIT_SHA=${{ github.sha }}
+            VERSION=${{ steps.meta.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # GATE de seguridad: falla el pipeline si hay CVE CRITICAL/HIGH con fix.
+      - name: Escaneo de vulnerabilidades (Trivy)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: local/${{ env.ECR_REPOSITORY }}:scan
+          format: table
+          exit-code: '1'
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          vuln-type: os,library
+
+      # SBOM: inventario de dependencias como artefacto auditable.
+      - name: Generar SBOM (Trivy)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: local/${{ env.ECR_REPOSITORY }}:scan
+          format: cyclonedx
+          output: sbom.cdx.json
+      - name: Subir SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: sbom.cdx.json
+
+      # Solo si pasó el scan: reetiqueta y publica a ECR (SHA + latest).
+      - name: Push a ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          docker tag local/${ECR_REPOSITORY}:scan  ${ECR_REGISTRY}/${ECR_REPOSITORY}:${TAG}
+          docker tag local/${ECR_REPOSITORY}:scan  ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest
+          docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:${TAG}
+          docker push ${ECR_REGISTRY}/${ECR_REPOSITORY}:latest
+
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy en EC2 (pull desde ECR + run endurecido)
+    needs: build-scan-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy por SSH
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          IMAGE_TAG: ${{ needs.build-scan-push.outputs.image_tag }}
+          AWS_REGION: ${{ env.AWS_REGION }}
+          ECR_REPOSITORY: ${{ env.ECR_REPOSITORY }}
+          CONTAINER_NAME: ${{ env.CONTAINER_NAME }}
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          envs: IMAGE_TAG,AWS_REGION,ECR_REPOSITORY,CONTAINER_NAME
+          script: |
+            set -euo pipefail
+
+            if [ -z "${IMAGE_TAG}" ]; then echo "ERROR: IMAGE_TAG vacío"; exit 1; fi
+
+            # --- Bootstrap: instala Docker solo si no existe ---
+            if ! command -v docker &> /dev/null; then
+              echo "Docker no encontrado. Instalando..."
+              sudo dnf update -y
+              sudo dnf install -y docker
+              sudo systemctl enable --now docker
+              sudo mkdir -p /usr/local/lib/docker/cli-plugins
+              sudo curl -fsSL https://github.com/docker/compose/releases/download/v2.29.7/docker-compose-linux-x86_64 \
+                -o /usr/local/lib/docker/cli-plugins/docker-compose
+              sudo chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+              echo "Docker instalado correctamente."
+            fi
+
+            ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+            ECR_REGISTRY="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+            IMAGE="${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+
+            echo "Desplegando ${IMAGE}"
+
+            # Login a ECR usando el ROL IAM de la instancia (sin claves en el host).
+            aws ecr get-login-password --region "$AWS_REGION" \
+              | sudo docker login --username AWS --password-stdin "$ECR_REGISTRY"
+
+            # Red compartida frontend <-> backend (idempotente).
+            sudo docker network create web 2>/dev/null || true
+
+            sudo docker pull "$IMAGE"
+
+            sudo docker stop  "$CONTAINER_NAME" 2>/dev/null || true
+            sudo docker rm    "$CONTAINER_NAME" 2>/dev/null || true
+
+            # Run endurecido: non-root (en la imagen) + read-only + sin capabilities
+            # + sin escalada de privilegios + límites de recursos + tmpfs escribibles.
+            sudo docker run -d \
+              --name "$CONTAINER_NAME" \
+              --restart unless-stopped \
+              --network web \
+              -p 80:8080 \
+              --read-only \
+              --tmpfs /tmp \
+              --tmpfs /var/cache/nginx \
+              --cap-drop ALL \
+              --security-opt no-new-privileges \
+              --memory 128m --cpus 0.5 \
+              "$IMAGE"
+
+            sudo docker image prune -f

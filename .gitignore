@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.env
+*.local
+api-contract.md
+
+# SBOM (generado por CI, subido como artefacto)
+sbom.cdx.json

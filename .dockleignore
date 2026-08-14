@@ -1,0 +1,11 @@
+# CIS-DI-0010: FALSO POSITIVO heredado de la imagen base OFICIAL de nginx.
+# Dockle marca el ENV "KEY_SHA512" que aparece en el historial de capas de la
+# base. NO es una credencial: es el checksum SHA512 PÚBLICO que la imagen oficial
+# de nginx usa para verificar la firma del paquete durante SU propio build.
+# - Está en la capa de la base, no en nuestro Dockerfile.
+# - El mismo hallazgo aparece en cualquier imagen basada en nginx oficial
+#   (incluida nginxinc/nginx-unprivileged).
+# - Verificado: nuestra imagen final NO expone ENV con secretos
+#   (solo PATH, NGINX_VERSION, PKG_RELEASE, DYNPKG_RELEASE).
+# Equivalente a escanear con:  dockle --accept-key KEY_SHA512 <img>
+CIS-DI-0010

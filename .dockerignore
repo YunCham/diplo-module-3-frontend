@@ -1,0 +1,49 @@
+# --- Dependencias y build (se generan dentro de la imagen) ---
+node_modules
+dist
+dist-ssr
+*.local
+
+# --- Control de versiones / CI ---
+.git
+.gitignore
+.gitattributes
+.github
+
+# --- Secretos y entorno (NUNCA deben entrar al contexto de build) ---
+.env
+.env.*
+!.env.template
+
+# --- Tests (no van al contexto de build de una imagen de runtime) ---
+**/*.test.ts
+**/*.test.tsx
+**/*.spec.ts
+**/*.spec.tsx
+**/__tests__
+**/__mocks__
+
+# --- Caches y artefactos de herramientas ---
+tsconfig.tsbuildinfo
+.eslintcache
+.cache
+coverage
+.vite
+
+# --- Gestores alternativos (usamos npm/package-lock) ---
+pnpm-lock.yaml
+pnpm-workspace.yaml
+yarn.lock
+
+# --- Editor / SO ---
+.vscode
+.idea
+.DS_Store
+Thumbs.db
+*.log
+
+# --- Docs y el propio tooling de contenedores ---
+*.md
+Dockerfile
+.dockerignore
+docker-compose*.yml
